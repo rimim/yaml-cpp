@@ -25,9 +25,7 @@ std::size_t Emitter::size() const { return m_stream.pos(); }
 // state checking
 bool Emitter::good() const { return m_pState->good(); }
 
-const std::string Emitter::GetLastError() const {
-  return m_pState->GetLastError();
-}
+std::string Emitter::GetLastError() const { return m_pState->GetLastError(); }
 
 // global setters
 bool Emitter::SetOutputCharset(EMITTER_MANIP value) {
@@ -90,6 +88,10 @@ bool Emitter::SetDoublePrecision(std::size_t n) {
   return m_pState->SetDoublePrecision(n, FmtScope::Global);
 }
 
+bool Emitter::SetShowTrailingZero(bool value) {
+  return m_pState->SetShowTrailingZero(value, FmtScope::Global);
+}
+
 void Emitter::RestoreGlobalModifiedSettings() {
   m_pState->RestoreGlobalModifiedSettings();
 }
@@ -138,6 +140,11 @@ Emitter& Emitter::SetLocalValue(EMITTER_MANIP value) {
 
 Emitter& Emitter::SetLocalIndent(const _Indent& indent) {
   m_pState->SetIndent(indent.value, FmtScope::Local);
+  return *this;
+}
+
+Emitter& Emitter::SetLocalWrap(const _Wrap& wrap) {
+  m_pState->SetWrap(wrap.value, FmtScope::Local);
   return *this;
 }
 
@@ -272,8 +279,6 @@ void Emitter::EmitNewline() {
   m_pState->SetNonContent();
 }
 
-bool Emitter::CanEmitNewline() const { return true; }
-
 // Put the stream in a state so we can simply write the next node
 // E.g., if we're in a sequence, write the "- "
 void Emitter::PrepareNode(EmitterNodeType::value child) {
@@ -304,8 +309,10 @@ void Emitter::PrepareTopNode(EmitterNodeType::value child) {
   if (child == EmitterNodeType::NoType)
     return;
 
-  if (m_pState->CurGroupChildCount() > 0 && m_stream.col() > 0)
+  if (m_pState->CurGroupChildCount() > 0 && m_stream.col() > 0
+    && !m_pState->HasBegunContent()) {
     EmitBeginDoc();
+  }
 
   switch (child) {
     case EmitterNodeType::NoType:
@@ -716,33 +723,33 @@ StringEscaping::value GetStringEscapingStyle(const EMITTER_MANIP emitterManip) {
   }
 }
 
-Emitter& Emitter::Write(const std::string& str) {
+Emitter& Emitter::Write(const char* str, std::size_t size) {
   if (!good())
     return *this;
 
   StringEscaping::value stringEscaping = GetStringEscapingStyle(m_pState->GetOutputCharset());
 
   const StringFormat::value strFormat =
-      Utils::ComputeStringFormat(str, m_pState->GetStringFormat(),
+      Utils::ComputeStringFormat(str, size, m_pState->GetStringFormat(),
                                  m_pState->CurGroupFlowType(), stringEscaping == StringEscaping::NonAscii);
 
-  if (strFormat == StringFormat::Literal || str.size() > 1024)
+  if (strFormat == StringFormat::Literal || size > 1024)
     m_pState->SetMapKeyFormat(YAML::LongKey, FmtScope::Local);
 
   PrepareNode(EmitterNodeType::Scalar);
 
   switch (strFormat) {
     case StringFormat::Plain:
-      m_stream << str;
+      m_stream.write(str, size);
       break;
     case StringFormat::SingleQuoted:
-      Utils::WriteSingleQuotedString(m_stream, str);
+      Utils::WriteSingleQuotedString(m_stream, str, size);
       break;
     case StringFormat::DoubleQuoted:
-      Utils::WriteDoubleQuotedString(m_stream, str, stringEscaping);
+      Utils::WriteDoubleQuotedString(m_stream, str, size, stringEscaping);
       break;
     case StringFormat::Literal:
-      Utils::WriteLiteralString(m_stream, str,
+      Utils::WriteLiteralString(m_stream, str, size,
                                 m_pState->CurIndent() + m_pState->GetIndent());
       break;
   }
@@ -752,12 +759,20 @@ Emitter& Emitter::Write(const std::string& str) {
   return *this;
 }
 
+Emitter& Emitter::Write(const std::string& str) {
+  return Write(str.data(), str.size());
+}
+
 std::size_t Emitter::GetFloatPrecision() const {
   return m_pState->GetFloatPrecision();
 }
 
 std::size_t Emitter::GetDoublePrecision() const {
   return m_pState->GetDoublePrecision();
+}
+
+bool Emitter::GetShowTrailingZero() const {
+  return m_pState->GetShowTrailingZero();
 }
 
 const char* Emitter::ComputeFullBoolName(bool b) const {
@@ -865,7 +880,7 @@ Emitter& Emitter::Write(const _Alias& alias) {
 
   PrepareNode(EmitterNodeType::Scalar);
 
-  if (!Utils::WriteAlias(m_stream, alias.content)) {
+  if (!Utils::WriteAlias(m_stream, alias.content.data(), alias.content.size())) {
     m_pState->SetError(ErrorMsg::INVALID_ALIAS);
     return *this;
   }
@@ -888,7 +903,7 @@ Emitter& Emitter::Write(const _Anchor& anchor) {
 
   PrepareNode(EmitterNodeType::Property);
 
-  if (!Utils::WriteAnchor(m_stream, anchor.content)) {
+  if (!Utils::WriteAnchor(m_stream, anchor.content.data(), anchor.content.size())) {
     m_pState->SetError(ErrorMsg::INVALID_ANCHOR);
     return *this;
   }
@@ -935,9 +950,13 @@ Emitter& Emitter::Write(const _Comment& comment) {
 
   PrepareNode(EmitterNodeType::NoType);
 
-  if (m_stream.col() > 0)
+  if (m_stream.col() == 0 &&
+      m_pState->CurGroupNodeType() == EmitterNodeType::BlockMap) {
+    m_stream << IndentTo(m_pState->CurIndent());
+  } else if (m_stream.col() > 0) {
     m_stream << Indentation(m_pState->GetPreCommentIndent());
-  Utils::WriteComment(m_stream, comment.content,
+  }
+  Utils::WriteComment(m_stream, comment.content.data(), comment.content.size(),
                       m_pState->GetPostCommentIndent());
 
   m_pState->SetNonContent();
@@ -964,8 +983,33 @@ Emitter& Emitter::Write(const Binary& binary) {
   if (!good())
     return *this;
 
+  const StringFormat::value strFormat = 
+      Utils::ComputeBinaryFormat(binary, m_pState->GetStringFormat(),
+                                 m_pState->CurGroupFlowType());
+
+  if (strFormat == StringFormat::Literal) 
+    m_pState->SetMapKeyFormat(YAML::LongKey, FmtScope::Local);
+  
   PrepareNode(EmitterNodeType::Scalar);
-  Utils::WriteBinary(m_stream, binary);
+
+  switch (strFormat) {
+    case StringFormat::SingleQuoted:
+      Utils::WriteSingleQuotedBinary(m_stream, binary);
+      break;
+    // For a long period of time, this function outputed the DoubleQuoted form
+    // regardless of the options. In order not to change the default behavior,
+    // when strFormat is Plain, it is still treated as DoubleQuoted.
+    case StringFormat::Plain:
+    case StringFormat::DoubleQuoted:
+      Utils::WriteBinary(m_stream, binary);
+      break;
+    case StringFormat::Literal:
+      Utils::WriteLiteralBinary(m_stream, binary, 
+                                m_pState->CurIndent() + m_pState->GetIndent(), 
+                                m_pState->GetWrap());
+      break;
+  }
+
   StartedScalar();
 
   return *this;
